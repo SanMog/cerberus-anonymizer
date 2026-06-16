@@ -1,5 +1,10 @@
 # CERBERUS
 
+![Python](https://img.shields.io/badge/python-3.8%2B-blue)
+![License: MIT](https://img.shields.io/badge/license-MIT-green)
+![Dependencies](https://img.shields.io/badge/dependencies-none-success)
+![PRs Welcome](https://img.shields.io/badge/PRs-welcome-brightgreen)
+
 **A fast, dependency-light anonymizer for messy real-world logs, traces and tickets.**
 
 CERBERUS de-identifies personal and commercially sensitive data inside raw
@@ -11,6 +16,9 @@ archiver, so it works where `pip install` is not an option.
 
 > ⚠️ CERBERUS is a privacy-engineering aid, not a compliance guarantee.
 > Always review output before sharing data. See [Limitations](#limitations).
+
+📄 For the design rationale and performance numbers, see the
+[Engineering Case Study](CASE_STUDY.md).
 
 ---
 
