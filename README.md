@@ -131,4 +131,4 @@ MIT — see [LICENSE](LICENSE).
 
 ## Author
 
-Created and maintained by **Alexander Mogilin**.
+Created and maintained by **SanMog**.
