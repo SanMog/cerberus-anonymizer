@@ -1,0 +1,22 @@
+{
+  "_comment": "Copy this file to cerberus_local.json and fill in YOUR values. cerberus_local.json is git-ignored and must NEVER be committed. Keep real employee names, logins and internal domains here only.",
+
+  "employee_names_and_logins": [
+    "Ivanov",
+    "Petrov",
+    "ivanov",
+    "ppetrov"
+  ],
+
+  "allowed_domains": [
+    "example.com",
+    "corp.example.com"
+  ],
+
+  "blocked_har_domains": [
+    "google.com",
+    "gmail.com",
+    "gstatic.com",
+    "google-analytics.com"
+  ]
+}

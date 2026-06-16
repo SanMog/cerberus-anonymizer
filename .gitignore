@@ -1,0 +1,28 @@
+# --- Secrets / organisation-specific data — NEVER commit ---
+cerberus_local.json
+mapping_keys.json
+
+# --- Working data folders (raw input and sanitized output) ---
+input_raw/
+output_clean/
+
+# --- Run artifacts ---
+cerberus_debug.log
+cerberus_run.log
+*.log
+Sanitized_Data_Migration_FINAL.zip
+Sanitized_Data_Migration_FINAL.7z
+
+# --- Python ---
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+.env
+
+# --- OS / editor ---
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
