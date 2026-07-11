@@ -24,15 +24,16 @@ MAPPING_FILE = BASE_DIR / "mapping_keys.json"
 DEBUG_LOG_FILE = BASE_DIR / "cerberus_debug.log"
 
 # Organisation-specific dictionaries (real employee names/logins, internal
-# domains) are NOT hardcoded here — they are loaded at runtime from a local,
+# domains) are NOT hardcoded here — they load at runtime from a local,
 # git-ignored file so this engine can be published without leaking PII or
-# identifying any employer. See cerberus_local.example.json.
+# identifying any employer/clients. See cerberus_local.example.json.
 LOCAL_CONFIG_FILE = BASE_DIR / "cerberus_local.json"
 
 def _load_local_config():
     cfg = {
         "employee_names_and_logins": [],
         "allowed_domains": [],
+        "keep_domains": [],
         "blocked_har_domains": ["google.com", "gmail.com", "gstatic.com"],
     }
     try:
@@ -63,14 +64,47 @@ def debug_log(msg: str) -> None:
         _debug_fh.flush()
 LOG_FILE = BASE_DIR / "cerberus_run.log"
 
-BINARY_SKIP_EXT = {
-    ".docx", ".pdf", ".xlsx", ".xls", ".doc", ".pptx", ".ppt",
-    ".png", ".jpg", ".jpeg", ".gif", ".bmp", ".ico", ".webp",
+# Изображения НЕ собираем: из них (скриншоты, EXIF) PII не вычистить, поэтому
+# они полностью отбрасываются, а не копируются в output.
+IMAGE_DROP_EXT = {
+    ".png", ".jpg", ".jpeg", ".gif", ".bmp", ".ico", ".webp", ".tiff",
+    ".tif", ".heic", ".heif", ".svg",
+}
+
+# Бинарные/непрозрачные файлы НЕ копируем: их нельзя вычистить от PII
+# (БД с клиентами, запись звонка, таблица, документ). Отбрасываем целиком.
+BINARY_DROP_EXT = {
+    ".docx", ".pdf", ".xlsx", ".xls", ".doc", ".pptx", ".ppt", ".rtf",
     ".zip", ".rar", ".7z", ".gz", ".tar", ".exe", ".dll", ".pcap",
-    ".pcapng", ".mp4", ".mp3", ".avi", ".mov", ".db", ".sqlite",
+    ".pcapng", ".mp4", ".mp3", ".wav", ".ogg", ".opus", ".m4a",
+    ".avi", ".mov", ".db", ".sqlite", ".sqlite3", ".mdb", ".accdb",
+    ".dat", ".dic", ".lock", ".bin",
 }
 
 ARCHIVE_RENAME_EXTS = {".zip", ".rar", ".7z", ".gz", ".tar"}
+
+# Многие логи сериализуют не-ASCII как октальные escape'ы UTF-8 (\320\222...).
+# Детекторы PII работают по тексту и такую кириллицу НЕ видят -> имена/адреса
+# утекают. Нормализуем: декодируем валидные UTF-8 руны в реальные символы
+# ДО анонимизации, чтобы все правила сработали.
+_OCTAL_RUN_RE = re.compile(r'(?:\\[0-3][0-7][0-7]){2,}')
+
+def _decode_octal_run(m):
+    raw = m.group(0)
+    buf = bytearray(int(tok, 8) for tok in raw.split("\\") if tok)
+    try:
+        decoded = buf.decode("utf-8")
+    except UnicodeDecodeError:
+        return raw  # не валидный UTF-8 — оставляем как было
+    # декодируем только если получили осмысленный текст (есть буквы)
+    if any(c.isalpha() for c in decoded):
+        return decoded
+    return raw
+
+def decode_octal_escapes(text: str) -> str:
+    if "\\" not in text:
+        return text
+    return _OCTAL_RUN_RE.sub(_decode_octal_run, text)
 
 class Mapper:
 
@@ -130,6 +164,9 @@ class Mapper:
         placeholder = f"[{type_}_{idx:02d}]"
         bucket[value] = placeholder
         self.counters[type_] = idx + 1
+        # v7.9 perf: версия растёт при каждом добавлении — ключ инвалидации
+        # кэша trie-регекса в apply_dictionary_burn.
+        self.version = getattr(self, "version", 0) + 1
         return placeholder
 
 PHONE_ANCHOR_RE = re.compile(
@@ -138,6 +175,25 @@ PHONE_ANCHOR_RE = re.compile(
     re.IGNORECASE,
 )
 PHONE_PLUS7_RE = re.compile(r"(\+7[\d\-\(\)\s]{8,13}\d)")
+# Российские номера БЕЗ '+': "7 495 152-32-27", "8 (800) 100-20-30",
+# "84951523227", "8-800-555-35-35". Требуем 7/8 + код + разбиение,
+# чтобы не цеплять случайные числовые ID.
+PHONE_RU_RE = re.compile(
+    r"(?<![\d\-])([78][\s\-]?\(?\d{3}\)?[\s\-]?\d{3}[\s\-]?\d{2}[\s\-]?\d{2})(?![\d\-])"
+)
+# CRM-поддомен раскрывает клиента: <org>.bitrix24.ru, <org>.amocrm.ru.
+CRM_SUBDOMAIN_RE = re.compile(
+    r"\b([a-z0-9][a-z0-9\-]{1,40})(\.(?:bitrix24|amocrm)\.(?:ru|com))\b",
+    re.IGNORECASE,
+)
+# CRM-идентификаторы лидов/контактов: contact_id: "LD444500", lead/show/444500.
+CRM_ID_FIELD_RE = re.compile(
+    r'("?(?:contact_id|lead_id|deal_id|client_id)"?\s*[:=]\s*")([^"]{2,})(")',
+    re.IGNORECASE,
+)
+CRM_URL_ID_RE = re.compile(
+    r'(/(?:lead|deal|contact|company)/(?:show/)?)(\d{3,})'
+)
 
 ANI_RE = re.compile(
     r'(?i)\b(OutboundAni|InboundAni|CallerId|makeCall)(\s*[:=]\s*)'
@@ -176,6 +232,12 @@ HAR_COOKIE_FIELD_RE = re.compile(
 )
 HAR_SETCOOKIE_RE = re.compile(
     r'(Set-Cookie["\']?\s*:\s*["\']?)([^;"\'\r\n]+)'
+)
+# Host в HAR-заголовках (:authority / Host) маскируем ЦЕЛИКОМ в [HOSTNAME] —
+# даже свою инфраструктуру, т.к. конкретный хост (admin.internal.example.com)
+# раскрывает внутреннюю топологию/инстанс, а не «о каком клиенте тикет».
+HAR_HOST_RE = re.compile(
+    r'("name"\s*:\s*"(?::authority|[Hh]ost)"\s*,\s*"value"\s*:\s*")([^"]+)(")'
 )
 
 DEATH_KEYS = [
@@ -216,12 +278,19 @@ HOME_PATH_RE = re.compile(r'(/(?:home|Users)/)([A-Za-z0-9._-]+)')
 
 LONG_DIGITS_RE = re.compile(r'\b\d{9,12}\b')
 
-# Лицевой счёт, написанный инлайн в тексте ("VIP ЛС 16989609"): 6+ цифр
-# (возможно с пробелами) после ЛС/л/с/лицевой счёт. Закрывает 8-значные
-# счета, которые не ловит LONG_DIGITS (9-12).
+# Лицевой счёт, написанный инлайн в тексте ("VIP ЛС 16989609", "ЛС: test777").
+# Значение — токен, содержащий хотя бы одну цифру (цифровой или буквенно-
+# цифровой счёт), возможно с пробелами-разделителями.
 LS_INLINE_RE = re.compile(
     r'(?<![А-Яа-яЁёA-Za-z])'
-    r'((?:ЛС|Л/С|лиц(?:евой)?\.?[ \t]*сч[её]т\w*))([ \t:№#]*)(\d[\d ]{4,}\d)',
+    r'((?:ЛС|Л/С|лиц(?:евой)?\.?[ \t]*сч[её]т\w*))([ \t:№#]*)'
+    r'((?=[A-Za-z0-9 \-]*\d)[A-Za-z0-9][A-Za-z0-9 \-]{2,}[A-Za-z0-9])',
+    re.IGNORECASE,
+)
+# Денежные суммы с валютой (баланс счёта): "47 344,60 ₽", "1 200 руб".
+CURRENCY_AMOUNT_RE = re.compile(
+    r'(?<![\d.,])(\d[\d   ]*(?:[.,]\d{1,2})?)'
+    r'(\s*(?:₽|руб(?:\.|лей|ля)?|RUB|р\.))',
     re.IGNORECASE,
 )
 
@@ -233,13 +302,70 @@ PATRONYMIC_RE = re.compile(
     r'\b([А-ЯЁ][а-яё]*(?:ович|евич|ич|овна|евна|ична|инична))\b'
 )
 
-# Loaded from cerberus_local.json (see _load_local_config). Empty by default.
+# Одинокие фамилии в свободном тексте (медзаметки, CRM-комментарии), которые
+# не попадают в дву-словные именные паттерны: ловим заглавное кириллическое
+# слово с характерным русским фамильным суффиксом. Склейка с пунктуацией
+# допускается (\b на границе). Перекос в приватность намеренный.
+SURNAME_RE = re.compile(
+    r'\b([А-ЯЁ][а-яё]+(?:ов|ова|ев|ева|ёв|ёва|ин|ина|ын|ына|'
+    r'ский|ская|цкий|цкая|цев|цева|енко|енков|чук|юк|ян|'
+    r'швили|дзе|ьев|ьева))\b'
+)
+
+# Свои email/SIP-домены (не анонимизируем). Из cerberus_local.json.
 ALLOWED_DOMAINS = {d.lower() for d in _LOCAL_CONFIG["allowed_domains"]}
+
+# Домены, которые НЕ прячем при сплошном поиске: (1) своя инфраструктура и
+# публичные почтовики/CDN/платформы — они не раскрывают, о КАКОМ КЛИЕНТЕ тикет.
+# Всё, чего тут нет (бренды клиентов), токенизируется в [DOMAIN]. Сравнение по
+# суффиксу: поддомены наследуют статус (sub.example.com — свой). Свои
+# инфраструктурные домены добавь в cerberus_local.json -> "keep_domains".
+DOMAIN_KEEP_WHITELIST = {
+    # публичные почтовики
+    "gmail.com", "mail.ru", "yandex.ru", "ya.ru", "outlook.com",
+    "hotmail.com", "icloud.com", "office365.com", "list.ru", "bk.ru",
+    "inbox.ru", "rambler.ru",
+    # публичные сервисы / CDN / платформы (не клиент-идентифицирующие)
+    "google.com", "gstatic.com", "googleapis.com", "google-analytics.com",
+    "googletagmanager.com", "microsoft.com", "windows.com", "live.com",
+    "cloudflare.com", "jsdelivr.net", "unpkg.com", "jquery.com",
+    "bootstrapcdn.com", "fontawesome.com", "github.com", "githubusercontent.com",
+    "bitrix24.ru", "amocrm.ru",
+} | {d.lower() for d in _LOCAL_CONFIG["keep_domains"]} | ALLOWED_DOMAINS
+
+def _domain_kept(d: str) -> bool:
+    d = d.lower().rstrip(".")
+    return any(d == a or d.endswith("." + a) for a in DOMAIN_KEEP_WHITELIST)
+
+# Отдельно стоящий домен (вне email-контекста): в логах, URL, HAR-заголовках
+# (:authority, Host, Referer). Требуем реальный TLD, чтобы не цеплять
+# "combined.js"/"file.pack". Лукбехайнды исключают @ (email уже обработан) и
+# середину поддомена.
+_TLD = (r'(?:ru|рф|com|net|org|su|by|kz|ua|am|ge|io|info|biz|me|tv|pro|app|'
+        r'dev|cloud|online|site|shop|store|tech|digital|agency|group)')
+STANDALONE_DOMAIN_RE = re.compile(
+    r'(?<![@\w.\-])'
+    r'((?:[a-zA-Z0-9](?:[a-zA-Z0-9\-]{0,61}[a-zA-Z0-9])?\.)+' + _TLD + r')'
+    r'(?![\w.\-])',
+    re.IGNORECASE,
+)
 
 BLOCKED_HAR_DOMAINS = tuple(_LOCAL_CONFIG["blocked_har_domains"])
 EMAIL_DOMAIN_RE = re.compile(
     r'@([A-Za-z0-9][A-Za-z0-9.\-]*\.[A-Za-z]{2,})\b'
 )
+# URL-encoded '@' (%40) перед доменом: "user%40client.example.ru". Без этого
+# домен не распознаётся как email-домен и утекает сырым (баг C-2).
+URLENC_EMAIL_DOMAIN_RE = re.compile(
+    r'%40([A-Za-z0-9][A-Za-z0-9.\-]*\.[A-Za-z]{2,})\b'
+)
+
+# Типы значений, которые надо «прожигать» по всему тексту (а не только там,
+# где сработал контекстный детектор). Закрывает класс «сырое значение рядом с
+# токеном раскрывает карту» (C-2): номер/токен/домен, единожды распознанный,
+# заменяется во ВСЕХ местах — в URL, путях, JSON, именах файлов.
+VALUE_BURN_TYPES = ("ACCOUNT", "PHONE", "TOKEN", "IP", "DOMAIN", "AMOUNT",
+                    "ORG", "ADDRESS", "SECRET")
 
 OPAQUE_TOKEN_RE = re.compile(r'\b[A-Za-z0-9][A-Za-z0-9_\-]{19,}\b')
 
@@ -247,8 +373,24 @@ SAPISIDHASH_RE = re.compile(r'\b(SAPISIDHASH)\s+(\S+)')
 
 IP_CHAIN_RE = re.compile(r'\b(?:\d{1,3}\.){3,}\d{1,3}\b')
 
+# Секреты в конфигах (Qt .conf / ini) и JSON: SSL-ключи/сертификаты, пароли,
+# логины авторизации, токены. Значение секретного ключа маскируем целиком.
+_SECRET_WORDS = (
+    r'(?:passwd|password|psw|pwd|pass|secret|apikey|api_key|privatekey|'
+    r'private_key|ssl|cert|credential|auth|login|token)'
+)
+SECRET_INI_RE = re.compile(
+    r'(?im)^([ \t]*[\w.\-/]*' + _SECRET_WORDS + r'[\w.\-/]*[ \t]*=[ \t]*)'
+    r'(@[A-Za-z]+\([^\r\n]*\)|"[^"\r\n]*"|[^\r\n]+?)[ \t]*$'
+)
+SECRET_JSON_RE = re.compile(
+    r'(?i)("[\w.\-]*' + _SECRET_WORDS + r'[\w.\-]*"\s*:\s*")([^"\\]*)(")'
+)
+# Пустые/нулевые Qt-значения не трогаем.
+_EMPTY_CONF_VAL_RE = re.compile(r'@(?:Invalid|ByteArray|Variant|String)\(\s*\)|""')
+
 # --- v7.4: добивка остаточных утечек ------------------------------------
-ANY_PLACEHOLDER = r'\[(?:USER|USER_OS|ACCOUNT|PHONE|TOKEN|HOSTNAME|ORG|ADDRESS|DOMAIN|IP|AMOUNT|ISSUE)_\d+\]'
+ANY_PLACEHOLDER = r'\[(?:USER|USER_OS|ACCOUNT|PHONE|TOKEN|HOSTNAME|ORG|ADDRESS|DOMAIN|IP|AMOUNT|ISSUE|SECRET)_\d+\]'
 # Кириллическое имя-слово, прилипшее к уже проставленному плейсхолдеру:
 # "Волков [USER_440]" / "[USER_10] Иванов". Соседний плейсхолдер доказывает,
 # что слово — компонент имени, которое распалось при сжигании соседей.
@@ -323,8 +465,8 @@ NAME_STOPWORDS = {
     "запрос", "клиент", "клиента", "система", "системе", "тест", "тестовый",
 }
 
-# Loaded from cerberus_local.json (see _load_local_config). Empty by default —
-# add your own employee surnames/logins to the local file, never to this repo.
+# Конкретные фамилии/логины сотрудников — из cerberus_local.json, НЕ из репо.
+# Пусто по умолчанию: движок опирается на структурные/морфологические детекторы.
 EMP_LIST = list(_LOCAL_CONFIG["employee_names_and_logins"])
 if EMP_LIST:
     EMP_LIST_RE = re.compile(
@@ -332,10 +474,11 @@ if EMP_LIST:
         re.IGNORECASE,
     )
 else:
-    EMP_LIST_RE = re.compile(r'(?!x)x')  # matches nothing when list is empty
+    EMP_LIST_RE = re.compile(r'(?!x)x')  # ничего не матчит, когда список пуст
 
 GENERIC_WORDS = {"public", "manager", "admin", "user", "default", "all users"}
 
+# Слова, которые НЕ анонимизируем (generic-термины ПО/инфраструктуры).
 PROTECTED_WORDS = {"vpbx", "bitrix", "kibana", "elastic", "office", "telecom"}
 
 def is_protected(value: str) -> bool:
@@ -343,11 +486,18 @@ def is_protected(value: str) -> bool:
     return v in GENERIC_WORDS or v in PROTECTED_WORDS
 
 def scan_decoded_for_names(text: str, mapper: Mapper) -> None:
+    # Назначение функции — имена, СПРЯТАННЫЕ в URL-encoding. Значения на
+    # строках без '%' видны в сыром тексте и обрабатываются prepass/eraser
+    # штатно. Поэтому декодируем и сканируем только строки с '%' — на больших
+    # трейсах это на порядок меньше текста (v7.9 perf).
+    if "%" not in text:
+        return
+    subset = "\n".join(ln for ln in text.splitlines() if "%" in ln)
     try:
-        decoded = urllib.parse.unquote(text, encoding="utf-8", errors="replace")
+        decoded = urllib.parse.unquote(subset, encoding="utf-8", errors="replace")
     except Exception:
         return
-    if decoded == text:
+    if decoded == subset:
         return
 
     for m in CYRILLIC_NAME_RE.finditer(decoded):
@@ -390,13 +540,43 @@ def apply_global_prepass(text: str, mapper: Mapper) -> str:
         debug_log(f"    prepass/{name}: {_now - _pp_t0:.2f}s")
         _pp_t0 = _now
 
+    # v7.9 perf: дешёвые литеральные гарды. Regex-проход по 30 МБ без
+    # совпадений стоит ~0.5-1 с; проверка `substr in text` — миллисекунды.
+    # tl считается один раз: замены вставляют только плейсхолдеры [TYPE_NN]
+    # и не могут ПОРОДИТЬ якорное слово, так что гард не может ошибочно
+    # пропустить правило (только лишний раз запустить — это безопасно).
+    tl = text.lower()
+
+    def repl_secret_ini(m):
+        val = m.group(2).strip()
+        if not val or val.startswith("[") or _EMPTY_CONF_VAL_RE.fullmatch(val):
+            return m.group(0)
+        return m.group(1) + mapper.get_placeholder(val, "SECRET")
+    _has_secret_word = any(w in tl for w in (
+        "passw", "psw", "pwd", "pass", "secret", "apikey", "api_key",
+        "privatekey", "private_key", "ssl", "cert", "credential", "auth",
+        "login", "token"))
+    if _has_secret_word:
+        text = SECRET_INI_RE.sub(repl_secret_ini, text)
+    _pp('SECRET_INI')
+
+    def repl_secret_json(m):
+        val = m.group(2)
+        if not val or val.startswith("["):
+            return m.group(0)
+        return m.group(1) + mapper.get_placeholder(val, "SECRET") + m.group(3)
+    if _has_secret_word:
+        text = SECRET_JSON_RE.sub(repl_secret_json, text)
+    _pp('SECRET_JSON')
+
     def repl_user_bs(m):
         val = m.group(1)
         if val.lower() in GENERIC_WORDS:
             return m.group(0)
         ph = mapper.get_placeholder(val, "USER_OS")
         return "C:\\Users\\" + ph
-    text = USER_OS_BACKSLASH_RE.sub(repl_user_bs, text)
+    if ":\\users\\" in tl:
+        text = USER_OS_BACKSLASH_RE.sub(repl_user_bs, text)
     _pp('USER_OS_BACKSLASH')
 
     def repl_user_fs(m):
@@ -405,7 +585,8 @@ def apply_global_prepass(text: str, mapper: Mapper) -> str:
             return m.group(0)
         ph = mapper.get_placeholder(val, "USER_OS")
         return "C:/Users/" + ph
-    text = USER_OS_FORWARDSLASH_RE.sub(repl_user_fs, text)
+    if ":/users/" in tl:
+        text = USER_OS_FORWARDSLASH_RE.sub(repl_user_fs, text)
     _pp('USER_OS_FORWARDSLASH')
 
     def repl_kv(rx, type_, src_text):
@@ -417,13 +598,17 @@ def apply_global_prepass(text: str, mapper: Mapper) -> str:
             return m.group(1) + ph
         return rx.sub(repl, src_text)
 
-    text = repl_kv(USERNAME_VAR_RE, "USER_OS", text)
+    if "USERNAME" in text:
+        text = repl_kv(USERNAME_VAR_RE, "USER_OS", text)
     _pp('USERNAME_VAR')
-    text = repl_kv(COMPUTERNAME_RE, "HOSTNAME", text)
+    if "COMPUTERNAME" in text:
+        text = repl_kv(COMPUTERNAME_RE, "HOSTNAME", text)
     _pp('COMPUTERNAME')
-    text = repl_kv(USERDOMAIN_RE, "HOSTNAME", text)
+    if "USERDOMAIN" in text:
+        text = repl_kv(USERDOMAIN_RE, "HOSTNAME", text)
     _pp('USERDOMAIN')
-    text = repl_kv(LOGONSERVER_RE, "HOSTNAME", text)
+    if "LOGONSERVER" in text:
+        text = repl_kv(LOGONSERVER_RE, "HOSTNAME", text)
     _pp('LOGONSERVER')
 
     def repl_ani(m):
@@ -432,18 +617,46 @@ def apply_global_prepass(text: str, mapper: Mapper) -> str:
             return m.group(0)
         ph = mapper.get_placeholder(val, "PHONE")
         return f"{key}{sep}{ph}"
-    text = ANI_RE.sub(repl_ani, text)
+    if any(w in tl for w in ("outboundani", "inboundani", "callerid", "makecall")):
+        text = ANI_RE.sub(repl_ani, text)
     _pp('ANI')
 
     def repl_phone(m):
         ph = mapper.get_placeholder(m.group(1), "PHONE")
         return m.group(0).replace(m.group(1), ph)
-    text = PHONE_ANCHOR_RE.sub(repl_phone, text)
+    if any(w in tl for w in ("тел", "номер", "phone")):
+        text = PHONE_ANCHOR_RE.sub(repl_phone, text)
     _pp('PHONE_ANCHOR')
-    text = PHONE_PLUS7_RE.sub(
+    if "+7" in text:
+        text = PHONE_PLUS7_RE.sub(
+            lambda m: mapper.get_placeholder(m.group(1), "PHONE"), text
+        )
+    _pp('PHONE_PLUS7')
+    text = PHONE_RU_RE.sub(
         lambda m: mapper.get_placeholder(m.group(1), "PHONE"), text
     )
-    _pp('PHONE_PLUS7')
+    _pp('PHONE_RU')
+
+    def repl_crm_sub(m):
+        sub = m.group(1)
+        if sub.lower() in GENERIC_WORDS or is_protected(sub):
+            return m.group(0)
+        return mapper.get_placeholder(sub, "ORG") + m.group(2)
+    if "bitrix24" in tl or "amocrm" in tl:
+        text = CRM_SUBDOMAIN_RE.sub(repl_crm_sub, text)
+    _pp('CRM_SUBDOMAIN')
+
+    def repl_crm_id(m):
+        return m.group(1) + mapper.get_placeholder(m.group(2), "ACCOUNT") + m.group(3)
+    if "_id" in tl:
+        text = CRM_ID_FIELD_RE.sub(repl_crm_id, text)
+    _pp('CRM_ID_FIELD')
+
+    if any(w in tl for w in ("/lead", "/deal", "/contact", "/company")):
+        text = CRM_URL_ID_RE.sub(
+            lambda m: m.group(1) + mapper.get_placeholder(m.group(2), "ACCOUNT"), text
+        )
+    _pp('CRM_URL_ID')
 
     def repl_person(m):
         prefix, q, val, q2 = m.group(1), m.group(2), m.group(3), m.group(4)
@@ -475,7 +688,8 @@ def apply_global_prepass(text: str, mapper: Mapper) -> str:
             return m.group(0)
         ph = mapper.get_placeholder(local, "USER")
         return "sip:" + ph + "@"
-    text = SIP_RE.sub(repl_sip, text)
+    if "sip:" in tl:
+        text = SIP_RE.sub(repl_sip, text)
     _pp('SIP')
 
     def repl_email(m):
@@ -484,14 +698,16 @@ def apply_global_prepass(text: str, mapper: Mapper) -> str:
             return m.group(0)
         ph = mapper.get_placeholder(local, "USER")
         return ph + "@" + domain
-    text = EMAIL_RE.sub(repl_email, text)
+    if "@" in text:
+        text = EMAIL_RE.sub(repl_email, text)
     _pp('EMAIL')
 
     def repl_vpbx(m):
         prefix, num = m.group(1), m.group(2)
         ph = mapper.get_placeholder(num, "ACCOUNT")
         return prefix + ph
-    text = VPBX_RE.sub(repl_vpbx, text)
+    if "vpbx" in tl:
+        text = VPBX_RE.sub(repl_vpbx, text)
     _pp('VPBX')
 
     def repl_home(m):
@@ -500,7 +716,8 @@ def apply_global_prepass(text: str, mapper: Mapper) -> str:
             return m.group(0)
         ph = mapper.get_placeholder(val, "USER_OS")
         return prefix + ph
-    text = HOME_PATH_RE.sub(repl_home, text)
+    if "/home/" in text or "/Users/" in text:
+        text = HOME_PATH_RE.sub(repl_home, text)
     _pp('HOME_PATH')
 
     def repl_login_at(m):
@@ -509,7 +726,8 @@ def apply_global_prepass(text: str, mapper: Mapper) -> str:
             return m.group(0)
         ph = mapper.get_placeholder(login, "USER")
         return ph + "@"
-    text = LOGIN_AT_RE.sub(repl_login_at, text)
+    if "@" in text:
+        text = LOGIN_AT_RE.sub(repl_login_at, text)
     _pp('LOGIN_AT')
 
     def repl_domain(m):
@@ -518,14 +736,35 @@ def apply_global_prepass(text: str, mapper: Mapper) -> str:
             return m.group(0)
         ph = mapper.get_placeholder(domain.lower(), "DOMAIN")
         return "@" + ph
-    text = EMAIL_DOMAIN_RE.sub(repl_domain, text)
+    if "@" in text:
+        text = EMAIL_DOMAIN_RE.sub(repl_domain, text)
     _pp('EMAIL_DOMAIN')
+
+    def repl_urlenc_domain(m):
+        domain = m.group(1)
+        if domain.lower() in ALLOWED_DOMAINS:
+            return m.group(0)
+        ph = mapper.get_placeholder(domain.lower(), "DOMAIN")
+        return "%40" + ph
+    if "%40" in text:
+        text = URLENC_EMAIL_DOMAIN_RE.sub(repl_urlenc_domain, text)
+    _pp('URLENC_EMAIL_DOMAIN')
+
+    def repl_standalone_domain(m):
+        domain = m.group(1)
+        if _domain_kept(domain):
+            return m.group(0)
+        # тот же тип DOMAIN — домен из почты и из лога получат один плейсхолдер
+        return mapper.get_placeholder(domain.lower(), "DOMAIN")
+    text = STANDALONE_DOMAIN_RE.sub(repl_standalone_domain, text)
+    _pp('STANDALONE_DOMAIN')
 
     def repl_sapisid(m):
         val = m.group(2)
         ph = mapper.get_placeholder(val, "TOKEN")
         return m.group(1) + " " + ph
-    text = SAPISIDHASH_RE.sub(repl_sapisid, text)
+    if "SAPISIDHASH" in text:
+        text = SAPISIDHASH_RE.sub(repl_sapisid, text)
     _pp('SAPISIDHASH')
 
     def repl_opaque(m):
@@ -549,8 +788,15 @@ def apply_global_prepass(text: str, mapper: Mapper) -> str:
 
     def repl_ls_inline(m):
         return m.group(1) + m.group(2) + mapper.get_placeholder(m.group(3), "ACCOUNT")
-    text = LS_INLINE_RE.sub(repl_ls_inline, text)
+    if "лс" in tl or "л/с" in tl or "сч" in tl:
+        text = LS_INLINE_RE.sub(repl_ls_inline, text)
     _pp('LS_INLINE')
+
+    def repl_currency(m):
+        return mapper.get_placeholder(m.group(1).strip(), "AMOUNT") + m.group(2)
+    if any(w in tl for w in ("₽", "руб", "rub", "р.")):
+        text = CURRENCY_AMOUNT_RE.sub(repl_currency, text)
+    _pp('CURRENCY_AMOUNT')
 
     def repl_long_digits(m):
         val = m.group(0)
@@ -564,7 +810,8 @@ def apply_global_prepass(text: str, mapper: Mapper) -> str:
         canon = val.lower()
         ph = mapper.get_placeholder(canon, "USER")
         return ph
-    text = EMP_LIST_RE.sub(repl_emp, text)
+    if EMP_LIST:
+        text = EMP_LIST_RE.sub(repl_emp, text)
     _pp('EMP_LIST')
 
     def repl_json_person(m):
@@ -580,7 +827,8 @@ def apply_global_prepass(text: str, mapper: Mapper) -> str:
         val = m.group(1).strip()
         ph = mapper.get_placeholder(val, "ORG")
         return ph
-    text = ORG_RE.sub(repl_org, text)
+    if any(w in text for w in ("ООО", "ОАО", "ЗАО", "ПАО", "АО", "ИП", "НКО", "АНО")):
+        text = ORG_RE.sub(repl_org, text)
     _pp('ORG')
 
     def repl_place_key(m):
@@ -589,7 +837,8 @@ def apply_global_prepass(text: str, mapper: Mapper) -> str:
             return m.group(0)
         ph = mapper.get_placeholder(val, "ADDRESS")
         return m.group(1) + ph + m.group(3)
-    text = PLACE_KEY_RE.sub(repl_place_key, text)
+    if any(w in tl for w in ("place", "address", "city", "location")):
+        text = PLACE_KEY_RE.sub(repl_place_key, text)
     _pp('PLACE_KEY')
 
     def repl_place_anchor(m):
@@ -598,12 +847,21 @@ def apply_global_prepass(text: str, mapper: Mapper) -> str:
             return m.group(0)
         ph = mapper.get_placeholder(val, "ADDRESS")
         return m.group(1) + ph
-    text = PLACE_ANCHOR_RE.sub(repl_place_anchor, text)
+    if "Местоположение" in text:
+        text = PLACE_ANCHOR_RE.sub(repl_place_anchor, text)
     _pp('PLACE_ANCHOR')
 
     return text
 
+_CYR_ANY_RE = re.compile(r'[А-Яа-яЁё]')
+
 def apply_universal_name_eraser(text: str, mapper: Mapper) -> str:
+    # v7.9 perf: все правила eraser'а кириллические. В ASCII-файле
+    # (conf/трейс без русских строк) делать нечего — один дешёвый поиск
+    # вместо шести полных regex-проходов.
+    if not _CYR_ANY_RE.search(text):
+        debug_log("    eraser: skipped (no cyrillic in file)")
+        return text
     _en_t0 = time.perf_counter()
     def _en(name):
         nonlocal _en_t0
@@ -642,6 +900,16 @@ def apply_universal_name_eraser(text: str, mapper: Mapper) -> str:
         return ph
     text = FIRST_NAME_RE.sub(repl_first_name, text)
     _en('FIRST_NAME')
+
+    def repl_surname(m):
+        word = m.group(1)
+        if word.lower() in NAME_STOPWORDS or word.lower() in GENERIC_WORDS \
+                or is_protected(word):
+            return m.group(0)
+        ph = mapper.get_placeholder(word, "USER")
+        return ph
+    text = SURNAME_RE.sub(repl_surname, text)
+    _en('SURNAME')
 
     # Имя-слово, прилипшее к плейсхолдеру: фамилия осталась открытой, потому
     # что соседние имя/отчество уже сожгли. Соседство с плейсхолдером —
@@ -683,6 +951,12 @@ def _build_trie_pattern(words):
     """
     trie = {}
     for w in words:
+        # Жёсткий предел глубины: to_regex рекурсивен по длине ключа. Длинное
+        # значение (мусорный захват SSL/конфига или его URL-encoded вариант)
+        # рвёт стек RecursionError. Реальные имена/хосты короче 120 символов.
+        # Фильтр здесь страхует ВСЕ пути вызова, а не только основной словарь.
+        if len(w) > 120:
+            continue
         node = trie
         for ch in w:
             node = node.setdefault(ch, {})
@@ -754,10 +1028,30 @@ def _burn_with_ahocorasick(text: str, pairs: dict) -> str:
 def apply_dictionary_burn(text: str, mapper: Mapper) -> str:
     has_percent = "%" in text
 
+    # v7.9 perf: кэш-хит по (версия маппера, has_percent) — словарь не менялся,
+    # готовый регекс и pairs переиспользуются, сборка пропускается целиком.
+    if not _HAS_AHOCORASICK:
+        cache = getattr(mapper, "_burn_cache", None)
+        key = (getattr(mapper, "version", 0), has_percent)
+        if cache is not None and cache[0] == key:
+            rx, cached_pairs = cache[1], cache[2]
+            if rx is not None:
+                _bn_t0 = time.perf_counter()
+                text = rx.sub(lambda m: cached_pairs[m.group(0)], text)
+                debug_log(f"    burn: trie-regex cached ({time.perf_counter() - _bn_t0:.2f}s)")
+            if EMP_LIST:
+                text = EMP_LIST_RE.sub(
+                    lambda m: m.group(0) if is_protected(m.group(0).lower())
+                    else mapper.get_placeholder(m.group(0).lower(), "USER"), text)
+            return text
+
     pairs = {}
     for type_ in ("USER", "USER_OS", "HOSTNAME"):
         for real, ph in mapper.data.get(type_, {}).items():
-            if len(real) < 3 or is_protected(real):
+            # Верхний предел длины: trie-regex рекурсивен по длине ключа, а
+            # очень длинное значение (мусорный захват куска SSL/конфига) рвёт
+            # стек RecursionError. Реальные имена/хосты короче 120 символов.
+            if len(real) < 3 or len(real) > 120 or is_protected(real):
                 continue
             pairs.setdefault(real, ph)
 
@@ -777,13 +1071,40 @@ def apply_dictionary_burn(text: str, mapper: Mapper) -> str:
                 if enc_lower != enc:
                     pairs.setdefault(enc_lower, ph)
 
+    # v7.5: прожигаем и значения (счета/токены/домены/IP/суммы) по всему тексту.
+    # Это закрывает C-2: значение, единожды распознанное контекстным детектором,
+    # больше не остаётся сырым в URL/путях/именах файлов. Защита от порчи:
+    # пропускаем короткие и чисто-числовые короткие значения (могут совпасть со
+    # случайными числами и сломать данные). Границы слова — в _burn_with_*.
+    for type_ in VALUE_BURN_TYPES:
+        for real, ph in mapper.data.get(type_, {}).items():
+            r = real.strip()
+            if len(r) < 5 or is_protected(r):
+                continue
+            if r.isdigit() and len(r) < 6:
+                continue
+            pairs.setdefault(r, ph)
+
     if pairs:
         debug_log(f"    burn: pairs={len(pairs)}")
         if _HAS_AHOCORASICK:
             text = _burn_with_ahocorasick(text, pairs)
         else:
+            # v7.9 perf: кэш собранного trie-регекса. Burn зовётся 2+ раза на
+            # файл и на каждом файле корпуса; словарь только растёт, поэтому
+            # ключ (версия маппера, has_percent) однозначно определяет pairs.
             _bn_t0 = time.perf_counter()
-            text = _burn_with_trie_regex(text, pairs)
+            cache = getattr(mapper, "_burn_cache", None)
+            key = (getattr(mapper, "version", 0), has_percent)
+            if cache is not None and cache[0] == key:
+                rx, cached_pairs = cache[1], cache[2]
+            else:
+                pattern = _build_trie_pattern(pairs.keys())
+                rx = re.compile(r'(?<!\w)(?:' + pattern + r')(?!\w)') if pattern else None
+                cached_pairs = pairs
+                mapper._burn_cache = (key, rx, cached_pairs)
+            if rx is not None:
+                text = rx.sub(lambda m: cached_pairs[m.group(0)], text)
             debug_log(f"    burn: trie-regex done ({time.perf_counter() - _bn_t0:.2f}s)")
 
     def repl_emp2(m):
@@ -792,7 +1113,8 @@ def apply_dictionary_burn(text: str, mapper: Mapper) -> str:
             return m.group(0)
         ph = mapper.get_placeholder(canon, "USER")
         return ph
-    text = EMP_LIST_RE.sub(repl_emp2, text)
+    if EMP_LIST:
+        text = EMP_LIST_RE.sub(repl_emp2, text)
 
     return text
 
@@ -808,6 +1130,7 @@ def apply_jira_profile(text: str, mapper: Mapper) -> str:
         ph = mapper.get_placeholder(name_clean, "USER")
         if login:
             mapper.data.setdefault("USER", {})[login] = ph
+            mapper.version = getattr(mapper, "version", 0) + 1
         return f"{anchor}: {ph}"
     text = JIRA_ANCHOR_RE.sub(repl_anchor, text)
 
@@ -899,6 +1222,13 @@ def apply_har_profile(text: str, mapper: Mapper) -> str:
         ph = mapper.get_placeholder(val, "TOKEN")
         return m.group(1) + ph
     text = HAR_SETCOOKIE_RE.sub(repl_setcookie, text)
+
+    def repl_har_host(m):
+        val = m.group(2).strip()
+        if not val or val.startswith("["):
+            return m.group(0)
+        return m.group(1) + mapper.get_placeholder(val, "HOSTNAME") + m.group(3)
+    text = HAR_HOST_RE.sub(repl_har_host, text)
 
     text = apply_dictionary_burn(text, mapper)
 
@@ -1045,14 +1375,37 @@ def create_final_zip(log):
         log(f"Запуск 7-Zip не удался ({e}). Создан архив БЕЗ пароля: {zip_path2}")
         return
 
-    if res.returncode == 0:
+    # Код 0 = ок, 1 = предупреждение (архив всё равно создан). Решаем по факту
+    # наличия непустого архива, а НЕ только по коду — иначе при warning'е
+    # сработал бы фолбэк и создал второй, незашифрованный zip рядом.
+    archived = (res.returncode in (0, 1)
+                and arch_path.exists() and arch_path.stat().st_size > 0)
+    if archived:
+        if res.returncode == 1:
+            log("7-Zip: предупреждение (код 1), но архив создан.")
         prot = ("с паролем, AES-256 + шифрование имён (-mhe)" if pwd
                 else "БЕЗ пароля")
         log(f"Анонимизация завершена. Архив {prot}: {arch_path}")
+        return
+
+    # Архив не создан — убираем возможный битый файл.
+    if arch_path.exists():
+        try:
+            arch_path.unlink()
+        except OSError:
+            pass
+    if pwd:
+        # НЕ создаём незашифрованный zip вместо запрошенного зашифрованного.
+        log(f"ОШИБКА: 7-Zip не создал зашифрованный архив (код {res.returncode}).")
+        err = (res.stderr or "").strip()
+        if err:
+            log(f"7-Zip stderr: {err[:300]}")
+        log("Архив БЕЗ пароля НЕ создаю (это был бы слив). "
+            "Заархивируй output_clean вручную с паролем.")
     else:
         zip_path2 = _plain_zip(log)
-        log(f"7-Zip вернул ошибку (код {res.returncode}). "
-            f"Создан архив БЕЗ пароля: {zip_path2}")
+        log(f"7-Zip не справился (код {res.returncode}). "
+            f"Создан обычный zip: {zip_path2}")
 
 def main():
     INPUT_DIR.mkdir(exist_ok=True)
@@ -1074,7 +1427,7 @@ def main():
         print(msg)
         log_lines.append(msg)
 
-    log("=== CERBERUS v7.3 (Precision Strike + Turbo Burn) ===")
+    log("=== CERBERUS v8.0 (Perf + Domain-Split + HAR-Host + Trie-Depth-Fix) ===")
     log(f"Папка входа:  {INPUT_DIR}")
     log(f"Папка выхода: {OUTPUT_DIR}")
     log(f"Маппинг:      {MAPPING_FILE}")
@@ -1095,27 +1448,30 @@ def main():
     for i, src in enumerate(all_files, 1):
         rel = src.relative_to(INPUT_DIR)
 
-        if src.suffix.lower() in BINARY_SKIP_EXT:
-            new_name = mapper.register_file(str(rel), src.suffix.lower())
-            dst = OUTPUT_DIR / new_name
-            shutil.copy2(src, dst)
-            log(f"[COPY-BIN] {rel} -> {new_name}")
+        if src.suffix.lower() in IMAGE_DROP_EXT:
+            log(f"[DROP-IMG] {rel} -> отброшено (изображение не очищается от PII)")
+            skipped += 1
+            print_progress(i, total, prefix="Обработка")
+            continue
+
+        if src.suffix.lower() in BINARY_DROP_EXT:
+            log(f"[DROP-BIN] {rel} -> отброшено (бинарь не очищается от PII)")
             skipped += 1
             print_progress(i, total, prefix="Обработка")
             continue
 
         text, enc = read_text_any_encoding(src)
         if text is None:
-            new_name = mapper.register_file(str(rel), src.suffix.lower() or ".bin")
-            dst = OUTPUT_DIR / new_name
-            shutil.copy2(src, dst)
-            log(f"[COPY-BINARY?] {rel} -> {new_name} (не удалось прочитать как текст)")
+            log(f"[DROP-BIN] {rel} -> отброшено (не читается как текст)")
             skipped += 1
             print_progress(i, total, prefix="Обработка")
             continue
 
         _t0 = time.perf_counter()
         debug_log(f"--- {rel} (size={len(text)} chars) ---")
+
+        text = decode_octal_escapes(text)
+        debug_log(f"  decode_octal_escapes: {time.perf_counter() - _t0:.2f}s")
 
         scan_decoded_for_names(text, mapper)
         debug_log(f"  scan_decoded_for_names: {time.perf_counter() - _t0:.2f}s")
@@ -1135,9 +1491,10 @@ def main():
             clean = apply_trace_profile(text, mapper)
         debug_log(f"  apply_{profile}_profile: {time.perf_counter() - _t:.2f}s")
 
-        _t = time.perf_counter()
-        clean = apply_dictionary_burn(clean, mapper)
-        debug_log(f"  apply_dictionary_burn #1: {time.perf_counter() - _t:.2f}s")
+        # v7.9 perf: отдельный burn #1 удалён — каждый профиль уже вызывает
+        # apply_dictionary_burn последним шагом, повторный проход по тому же
+        # тексту с тем же маппером даёт байт-в-байт тот же результат
+        # (проверено на бенчмарке), но стоит ~3.5 с на 30 МБ.
 
         _t = time.perf_counter()
         _clean_before_eraser = clean

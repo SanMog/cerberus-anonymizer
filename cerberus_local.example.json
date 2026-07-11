@@ -13,6 +13,11 @@
     "corp.example.com"
   ],
 
+  "keep_domains": [
+    "internal.example.com",
+    "cdn.example.com"
+  ],
+
   "blocked_har_domains": [
     "google.com",
     "gmail.com",
